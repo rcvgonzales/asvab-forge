@@ -211,6 +211,11 @@ const hydrate = (raw) => {
   if (!st.streak || typeof st.streak !== 'object') st.streak = base.streak
   // pre-diagnostic saves that already have a test shouldn't see the day-one banner
   if (raw.diagDone === undefined) st.diagDone = st.tests.length > 0
+  // repair LaTeX already saved before cleanMath existed
+  const okQ = (q) => q && typeof q.q === 'string' && Array.isArray(q.choices)
+  st.bank = Object.fromEntries(Object.entries(st.bank).map(([k, list]) => [k, (Array.isArray(list) ? list : []).filter(okQ).map(cleanQ)]))
+  st.missQueue = st.missQueue.filter(okQ).map(cleanQ)
+  st.lessons = cleanDeep(st.lessons)
   if (!st.daily || st.daily.date !== today()) st.daily = freshDaily()
   return st
 }
@@ -376,16 +381,20 @@ async function generate(prompt, maxTokens = 4096) {
   return body.data
 }
 
+const MATH_STYLE = 'Write all math as plain text using Unicode, exactly as a printed test would. Never use LaTeX, $ signs, or backslash commands. Use superscripts (x², 3ˣ⁺¹), √ for roots (√72 or √(x+1)), π, ×, ÷, ≤, ≥, and fractions as a/b.'
+
 const questionPrompt = (sub, n, level, notes) => `You are an ASVAB question writer. Generate ${n} multiple-choice questions for the ${sub.name} (${sub.id}) subtest of the US Armed Services Vocational Aptitude Battery.
 Subtest scope: ${sub.desc}
 This batch must draw from these exam-blueprint topics (distribute questions across them): ${sampleTopics(sub.id).join('; ')}.
 ${notes ? `Ground questions in the user's own study notes below where relevant — test the same concepts, but write original questions (never copy sentences from the notes):\n<notes>${notes.slice(0, 1500)}</notes>\n` : ''}Target difficulty: ${level}. Match the tone and style of official ASVAB practice questions. Questions must be fully self-contained text (no images or diagrams). Each has exactly 4 answer choices with exactly one correct answer, plus a concise explanation teaching the underlying concept.
 Respond with RAW JSON ONLY — no markdown, no commentary. Schema:
 [{"q":"question text","choices":["A","B","C","D"],"answer":0,"explanation":"why"}]
-"answer" is the 0-based index of the correct choice. Vary which index is correct.`
+"answer" is the 0-based index of the correct choice. Vary which index is correct.
+${MATH_STYLE}`
 
 const verifyPrompt = (qs) => `You are an answer-key auditor for ASVAB math questions. Independently solve each question below, showing no work, and report the index of the correct choice.
 Respond with RAW JSON ONLY. Schema: [{"i":0,"answer":2}] where "i" is the question number given and "answer" is the 0-based index of the correct choice.
+${MATH_STYLE}
 Questions:
 ${JSON.stringify(qs.map((q, i) => ({ i, q: q.q, choices: q.choices })))}`
 
@@ -395,12 +404,80 @@ Respond with RAW JSON ONLY. Schema:
 
 const lessonPrompt = (sub, topic, notes) => `You are an ASVAB tutor. Write a compact lesson on "${topic}" for the ${sub.name} (${sub.id}) subtest, for a motivated adult learner starting from scratch.
 ${notes ? `The learner's own notes (build on them, don't copy sentences):\n<notes>${notes.slice(0, 1500)}</notes>\n` : ''}Respond with RAW JSON ONLY. Schema:
-{"title":"...","core":"2-3 short paragraphs teaching the concept plainly","steps":["step-by-step method to attack this question type, 3-5 items"],"example":{"q":"one worked ASVAB-style example question","solution":"solution walking through each step"},"trap":"the single most common mistake test-takers make here","mnemonic":"a memory hook if one exists, else empty string"}`
+{"title":"...","core":"2-3 short paragraphs teaching the concept plainly","steps":["step-by-step method to attack this question type, 3-5 items"],"example":{"q":"one worked ASVAB-style example question","solution":"solution walking through each step"},"trap":"the single most common mistake test-takers make here","mnemonic":"a memory hook if one exists, else empty string"}
+${MATH_STYLE}`
+
+/* Safety net for models that ignore MATH_STYLE: LaTeX → printed-test Unicode.
+   Money stays intact: a $…$ pair is only treated as math when it holds LaTeX markers. */
+const SUP = { 0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹',
+  '+': '⁺', '-': '⁻', '−': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', n: 'ⁿ', x: 'ˣ', i: 'ⁱ', y: 'ʸ' }
+const SUB_CH = { 0: '₀', 1: '₁', 2: '₂', 3: '₃', 4: '₄', 5: '₅', 6: '₆', 7: '₇', 8: '₈', 9: '₉',
+  '+': '₊', '-': '₋', '−': '₋', '=': '₌', '(': '₍', ')': '₎', a: 'ₐ', e: 'ₑ', o: 'ₒ', x: 'ₓ', n: 'ₙ', i: 'ᵢ' }
+const SYMBOLS = {
+  pi: 'π', times: '×', div: '÷', cdot: '·', leq: '≤', le: '≤', geq: '≥', ge: '≥', neq: '≠', ne: '≠',
+  pm: '±', approx: '≈', infty: '∞', circ: '°', degree: '°', theta: 'θ', alpha: 'α', beta: 'β',
+  angle: '∠', triangle: '△', perp: '⊥', parallel: '∥', cdots: '…', ldots: '…', lt: '<', gt: '>',
+}
+const LATEX_HINT = /\\[A-Za-z]|\^|_\{|[A-Za-z0-9)]_[A-Za-z0-9]/
+const script = (body, map, mark) => {
+  const t = body.replace(/\s+/g, '')
+  return [...t].every((c) => map[c]) ? [...t].map((c) => map[c]).join('') : t.length === 1 ? `${mark}${t}` : `${mark}(${t})`
+}
+const wrap = (a) => (/^[A-Za-z0-9.]+$/.test(a) || /^\(.*\)$/.test(a) ? a : `(${a})`)
+/* drop $…$ delimiters only around LaTeX; a non-math pair advances one $ so the
+   closing one can still open the next pair ("$5 and $\frac12$ of $10") */
+const stripMathDollars = (s) => {
+  const at = [...s.matchAll(/\$/g)].map((m) => m.index)
+  const drop = new Set()
+  for (let k = 0; k + 1 < at.length;) {
+    const body = s.slice(at[k] + 1, at[k + 1])
+    // a digit right after the closing $ means it opens an amount ("…of $10"), not math
+    if (LATEX_HINT.test(body) && !/[0-9]/.test(s[at[k + 1] + 1] || '')) { drop.add(at[k]); drop.add(at[k + 1]); k += 2 } else k += 1
+  }
+  return s.split('').filter((c, i) => !drop.has(i)).join('')  // UTF-16 units, matching matchAll indices
+}
+export function cleanMath(str) {
+  if (typeof str !== 'string' || !/[\\$^_]/.test(str)) return str
+  let s = str.replace(/\\\$/g, '\u0000')                            // escaped money \$5 → protect
+  s = s.replace(/\$\$([\s\S]+?)\$\$/g, '$1')                         // $$…$$
+  s = stripMathDollars(s)
+    .replace(/\\\(|\\\)|\\\[|\\\]/g, '')                             // \( \) \[ \]
+    .replace(/\$(?=\\)/g, '')                                        // unmatched $ before a command
+  if (!LATEX_HINT.test(s)) return s.replace(/\u0000/g, '$')
+  s = s.replace(/\\(?:text|textrm|textbf|mathrm|mathbf|operatorname)\s*\{([^{}]*)\}/g, '$1')
+    .replace(/\\(?:left|right|displaystyle|,|;|!|quad|qquad)/g, (m) => (/quad/.test(m) ? ' ' : ''))
+    .replace(/\\%/g, '%')
+  // innermost-first so nested \frac / \sqrt resolve
+  for (let k = 0; k < 6; k++) {
+    const before = s
+    s = s.replace(/\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, (m, a, b) => `${wrap(a.trim())}/${wrap(b.trim())}`)
+      .replace(/\\sqrt\s*\[([^\]]*)\]\s*\{([^{}]*)\}/g, (m, n, a) => `${script(n, SUP, '')}√${/^([0-9.]+|[A-Za-z])$/.test(a.trim()) ? a.trim() : `(${a.trim()})`}`)
+      .replace(/\\sqrt\s*\{([^{}]*)\}/g, (m, a) => (/^([0-9.]+|[A-Za-z])$/.test(a.trim()) ? `√${a.trim()}` : `√(${a.trim()})`))
+    if (s === before) break
+  }
+  s = s.replace(/\\sqrt\s*([0-9.]+|[A-Za-z])/g, '√$1')
+    .replace(/\\([A-Za-z]+)(?![A-Za-z])/g, (m, name) => (SYMBOLS[name] ?? m))
+    .replace(/\^\s*\{\s*\\?circ\s*\}|\^\s*°/g, '°')
+    .replace(/\^\s*\{([^{}]*)\}/g, (m, b) => script(b, SUP, '^'))
+    .replace(/\^(-?[0-9]+|[A-Za-z])/g, (m, b) => script(b, SUP, '^'))
+    .replace(/([A-Za-z0-9)])_\s*\{([^{}]*)\}/g, (m, pre, b) => pre + script(b, SUB_CH, '_'))
+    .replace(/([A-Za-z0-9)])_([0-9]|[A-Za-z](?![A-Za-z]))/g, (m, pre, b) => pre + script(b, SUB_CH, '_'))
+    .replace(/\\\\/g, ' ')                                           // LaTeX line break
+    .replace(/\\[A-Za-z]+\*?/g, '')                                  // any command left over
+    .replace(/[{}]/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+  return s.replace(/\u0000/g, '$').trim()
+}
+/* deep-clean every string in a lesson / any JSON value */
+const cleanDeep = (v) => (typeof v === 'string' ? cleanMath(v)
+  : Array.isArray(v) ? v.map(cleanDeep)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, cleanDeep(x)])) : v)
+const cleanQ = (q) => ({ ...q, q: cleanMath(q.q), choices: q.choices.map((c) => cleanMath(String(c))), explanation: cleanMath(String(q.explanation || '')) })
 
 const sanitize = (data) => (Array.isArray(data) ? data : []).filter(
   (q) => q && typeof q.q === 'string' && q.q.trim() && Array.isArray(q.choices) && q.choices.length === 4 &&
          Number.isInteger(q.answer) && q.answer >= 0 && q.answer < 4
-).map((q) => ({ q: q.q, choices: q.choices.map(String), answer: q.answer, explanation: String(q.explanation || '') }))
+).map((q) => cleanQ({ q: q.q, choices: q.choices.map(String), answer: q.answer, explanation: String(q.explanation || '') }))
 
 /* Generate + (for math subtests) verify the answer keys with a second pass.
    Questions where the auditor disagrees with the writer are dropped. */
@@ -1268,7 +1345,8 @@ function Learn({ state, setState, goHome, initialSub }) {
     try {
       const data = await generate(lessonPrompt(s, t, state.notes?.[s.id]), 3000)
       if (!data || !data.core) throw new Error('model returned no lesson body')
-      setState((st) => ({ ...st, lessons: { ...st.lessons, [`${s.id}|${t}`]: data } }))
+      const lesson = cleanDeep(data)
+      setState((st) => ({ ...st, lessons: { ...st.lessons, [`${s.id}|${t}`]: lesson } }))
     } catch (e) { setErr(e) } finally { setLoading(false) }
   }
 

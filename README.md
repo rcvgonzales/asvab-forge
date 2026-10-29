@@ -30,7 +30,9 @@ npm install
 npm run dev
 ```
 
-Backend tests (JSON extraction, 429 rate limiting, 422 on non-JSON output, SPA fallback):
+Frontend unit tests (`cleanMath`): `cd frontend && npm test`.
+
+Backend tests (JSON extraction, 429 rate limiting, 422 on non-JSON output, model fallback, SPA fallback):
 
 ```bash
 pip install pytest && pytest backend/
@@ -118,6 +120,7 @@ For Anthropic, create an `anthropic-api-key` secret the same way and deploy with
 
 **Questions and generation**
 - **Offline drills.** With fewer than 5 banked questions and no network, a drill serves whatever is banked instead of erroring. The error appears only when the bank for that subtest is empty.
+- **Plain-text math.** The question, lesson and auditor prompts all require printed-test Unicode (x², √(x+1), π, ×, a/b) and forbid LaTeX. As a safety net, `cleanMath()` in `App.jsx` converts any LaTeX that slips through. It runs on every question, choice, explanation and lesson field, and at load time on the saved bank, redemption queue and lessons. A `$…$` pair counts as math only when it contains LaTeX markers, so prices like `$12` survive. Unit tests: `cd frontend && npm test`.
 - **Audit tolerance.** Questions the auditor skips are kept. Only explicit disagreements are dropped.
 - **Gemini model chain.** `gemini-2.5-flash` (the original spec) is closed to new API users, and the newer Flash models return 503 "high demand" or hang at busy times. The backend tries `gemini-3.8-flash` → `gemini-3.5-flash` → `gemini-3.5-flash-lite`, moving on after 429/5xx or a 45s timeout. Bad-key and bad-request errors fail fast. Upstream timeouts return a 504 with a readable message instead of a bare 500, and the key goes in the `x-goog-api-key` header, never the URL.
 - **Separate secret.** The deploy uses `asvab-forge-gemini-key`, not `gemini-api-key`, because Study Forge already reads `gemini-api-key:latest` in the same project.
