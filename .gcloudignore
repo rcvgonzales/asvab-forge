@@ -1,0 +1,7 @@
+# what gcloud run deploy --source uploads to Cloud Build
+.gcloudignore
+.git
+.gitignore
+#!include:.gitignore
+.env
+backend/test_main.py
