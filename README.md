@@ -101,7 +101,7 @@ For Anthropic, create an `anthropic-api-key` secret the same way and deploy with
 ## Judgment calls
 
 **Scoring and progression**
-- **Readiness with partial data.** The AFQT readiness number uses whichever of VE/AR/MK have data, so it appears after your first drill. Composites stay strict ("need data" until every member subtest has attempts), as specified.
+- **Readiness needs the full AFQT picture.** The readiness number shows "need data" until VE (WK or PC), AR and MK all have attempts, so a strong WK session alone can't read as AFQT-ready. Composites follow the same rule.
 - **Adaptive difficulty uses a rolling window.** "Rolling accuracy" is the last 20 scored answers per subtest (`stats[id].recent`), not lifetime accuracy. It's recomputed every batch, so difficulty shifts mid-session. You need ≥5 answers in the window; before that it's "moderate".
 - **Ranks are sequential.** You can't skip a rank whose gate is still blocking. For example, 9000 XP with a best test of 85% holds E-5 Sergeant, not E-7. When you have the XP for the next rank but not its gate, the rank card shows **PROMOTION BLOCKED**.
 - **Redemption XP.** Correct reps earn +8 (+25 instead on mastery). A wrong rep resets the item to box 1 and earns nothing.

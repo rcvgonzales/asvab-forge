@@ -259,11 +259,14 @@ const bumpStreak = (streak) => {
 /* ---- derived: readiness, missions, rank ---- */
 const acc = (st, id) => (st.stats[id].attempted ? st.stats[id].correct / st.stats[id].attempted : null)
 
+/* null ("need data") until VE, AR and MK all have attempts — a strong WK session
+   alone shouldn't read as AFQT-ready */
 const readiness = (st) => {
   const ve = [acc(st, 'WK'), acc(st, 'PC')].filter((v) => v != null)
   const veAvg = ve.length ? ve.reduce((a, b) => a + b, 0) / ve.length : null
-  const parts = [veAvg, veAvg, acc(st, 'AR'), acc(st, 'MK')].filter((v) => v != null)
-  return parts.length ? Math.round((parts.reduce((a, b) => a + b, 0) / parts.length) * 100) : null
+  const parts = [veAvg, veAvg, acc(st, 'AR'), acc(st, 'MK')]
+  if (parts.some((v) => v == null)) return null
+  return Math.round((parts.reduce((a, b) => a + b, 0) / parts.length) * 100)
 }
 
 const compositeReadiness = (st, comp) => {
@@ -537,11 +540,13 @@ function ReadinessGauge({ state }) {
         )}
       </div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, margin: '6px 0 10px' }}>
-        <span style={{ fontFamily: F.mono, fontWeight: 700, fontSize: 52, color: est == null ? C.khaki : C.blaze, lineHeight: 1 }}>
-          {est == null ? '--' : est}
+        <span style={{ fontFamily: F.mono, fontWeight: 700, fontSize: est == null ? 28 : 52, color: est == null ? C.khaki : C.blaze, lineHeight: 1 }}>
+          {est == null ? 'need data' : est}
         </span>
         <span style={{ color: C.khaki, fontSize: 12 }}>
-          weighted accuracy across AR · WK · PC · MK (practice signal, not an official score)
+          {est == null
+            ? 'needs attempts in WK or PC, plus AR and MK — the diagnostic covers all of them'
+            : 'weighted accuracy across AR · WK · PC · MK (practice signal, NOT an official AFQT score)'}
         </span>
       </div>
       <div style={{ position: 'relative', paddingTop: 14 }}>
