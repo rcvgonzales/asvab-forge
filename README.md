@@ -49,7 +49,8 @@ docker run -p 8080:8080 -e GEMINI_API_KEY=your-key asvab-forge
 |---|---|---|
 | `LLM_PROVIDER` | `gemini` | `gemini` or `anthropic` |
 | `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | — | server-side only |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | |
+| `GEMINI_MODEL` | `gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite` | comma list: first is primary, the rest are fallbacks on 429/5xx/timeout |
+| `GEMINI_TIMEOUT` | `45` | seconds per model attempt |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | |
 | `GEMINI_THINKING_BUDGET` | `1024` | added on top of `max_tokens` (see below) |
 | `RATE_LIMIT_PER_HOUR` | `60` | per client IP, `/api/generate` only |
@@ -64,10 +65,12 @@ PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectN
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com secretmanager.googleapis.com
 
 # 1. store the key
-printf '%s' "your-gemini-key" | gcloud secrets create gemini-api-key --data-file=-
+# (strip the newline — a trailing \n in the key breaks the request header)
+grep '^GEMINI_API_KEY=' .env | cut -d= -f2- | tr -d '\n' | \
+  gcloud secrets create asvab-forge-gemini-key --data-file=-
 
 # 2. let the Cloud Run runtime service account read it
-gcloud secrets add-iam-policy-binding gemini-api-key \
+gcloud secrets add-iam-policy-binding asvab-forge-gemini-key \
   --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor"
 
@@ -78,7 +81,7 @@ gcloud run deploy asvab-forge \
   --allow-unauthenticated \
   --max-instances 1 \
   --set-env-vars LLM_PROVIDER=gemini \
-  --set-secrets GEMINI_API_KEY=gemini-api-key:latest
+  --set-secrets GEMINI_API_KEY=asvab-forge-gemini-key:latest
 ```
 
 For Anthropic, create an `anthropic-api-key` secret the same way and deploy with `--set-env-vars LLM_PROVIDER=anthropic --set-secrets ANTHROPIC_API_KEY=anthropic-api-key:latest`. Rotate a key with `gcloud secrets versions add <name> --data-file=-`. Scale-to-zero keeps a personal instance in the free tier.
@@ -116,6 +119,8 @@ For Anthropic, create an `anthropic-api-key` secret the same way and deploy with
 **Questions and generation**
 - **Offline drills.** With fewer than 5 banked questions and no network, a drill serves whatever is banked instead of erroring. The error appears only when the bank for that subtest is empty.
 - **Audit tolerance.** Questions the auditor skips are kept. Only explicit disagreements are dropped.
+- **Gemini model chain.** `gemini-2.5-flash` (the original spec) is closed to new API users, and the newer Flash models return 503 "high demand" or hang at busy times. The backend tries `gemini-3.8-flash` → `gemini-3.5-flash` → `gemini-3.5-flash-lite`, moving on after 429/5xx or a 45s timeout. Bad-key and bad-request errors fail fast. Upstream timeouts return a 504 with a readable message instead of a bare 500, and the key goes in the `x-goog-api-key` header, never the URL.
+- **Separate secret.** The deploy uses `asvab-forge-gemini-key`, not `gemini-api-key`, because Study Forge already reads `gemini-api-key:latest` in the same project.
 - **Gemini thinking budget.** gemini-2.5-flash counts thinking tokens against `maxOutputTokens`, which silently truncated long JSON such as lessons. The backend sets `thinkingBudget` (default 1024) and adds it on top of the requested `max_tokens`.
 - **`extract_json` picks the bracket that opens first.** A chatty reply wrapping `{"steps":[...]}` then parses as the object, not the inner array.
 - **Notes cap.** Up to 1500 characters of your notes go into both question and lesson prompts. Vocab dedup sends the newest 200 words in your deck.

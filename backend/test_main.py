@@ -20,6 +20,7 @@ def mod(tmp_path, monkeypatch):
     async def fake_llm(req):
         return 'Sure! Here you go:\n```json\n[{"q":"1+1?","choices":["1","2","3","4"],"answer":1}]\n```'
 
+    m.real_call_gemini = m.call_gemini
     monkeypatch.setattr(m, "call_gemini", fake_llm)
     monkeypatch.setattr(m, "call_anthropic", fake_llm)
     return m
@@ -71,6 +72,49 @@ def test_non_json_model_output_is_422(mod, monkeypatch):
 def test_validation(mod):
     r = TestClient(mod.app).post("/api/generate", json={"prompt": ""})
     assert r.status_code == 422 and "error" not in r.json()
+
+
+def test_gemini_falls_back_on_overload(mod, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(mod, "GEMINI_API_KEY", "test")
+    monkeypatch.setattr(mod, "GEMINI_MODELS", ["busy", "slow", "good"])
+    seen = []
+
+    async def once(client, model, req):
+        seen.append(model)
+        if model == "busy":
+            raise mod._Upstream(503, "Gemini busy 503: high demand")
+        if model == "slow":
+            raise httpx.ReadTimeout("timed out")
+        return '{"ok": true}'
+
+    monkeypatch.setattr(mod, "_gemini_once", once)
+    req = mod.GenRequest(prompt="x")
+    import asyncio
+
+    assert asyncio.run(mod.real_call_gemini(req)) == '{"ok": true}'
+    assert seen == ["busy", "slow", "good"]
+
+    # non-retryable (bad key) fails fast without trying fallbacks
+    async def bad(client, model, req):
+        seen.append(model)
+        raise mod._Upstream(400, "Gemini busy 400: API key not valid")
+
+    seen.clear()
+    monkeypatch.setattr(mod, "_gemini_once", bad)
+    with pytest.raises(mod.HTTPException) as e:
+        asyncio.run(mod.real_call_gemini(req))
+    assert e.value.status_code == 502 and seen == ["busy"]
+
+    # everything overloaded -> 503 with a human message
+    async def overloaded(client, model, req):
+        raise mod._Upstream(503, f"Gemini {model} 503")
+
+    monkeypatch.setattr(mod, "_gemini_once", overloaded)
+    with pytest.raises(mod.HTTPException) as e:
+        asyncio.run(mod.real_call_gemini(req))
+    assert e.value.status_code == 503 and "overloaded" in e.value.detail
 
 
 def test_health_and_spa(mod):

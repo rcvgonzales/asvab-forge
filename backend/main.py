@@ -10,7 +10,9 @@ Env vars:
   LLM_PROVIDER      gemini | anthropic          (default: gemini)
   GEMINI_API_KEY    required if provider=gemini
   ANTHROPIC_API_KEY required if provider=anthropic
-  GEMINI_MODEL      default: gemini-2.5-flash
+  GEMINI_MODEL      comma list, first = primary, rest = fallbacks on 429/5xx/timeout
+                    default: gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite
+  GEMINI_TIMEOUT    per-model attempt timeout in seconds (default: 45)
   ANTHROPIC_MODEL   default: claude-sonnet-4-6
   GEMINI_THINKING_BUDGET  default: 1024 (added on top of max_tokens so thinking can't truncate output)
   STATIC_DIR        default: ./static next to this file (Docker copies the Vite build here)
@@ -31,9 +33,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # secrets often carry a trailing newline
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+# gemini-2.5-flash is closed to new API users; first model is primary, the rest are fallbacks
+GEMINI_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_MODEL", "gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite").split(",")
+    if m.strip()
+]
+GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "45"))
+RETRYABLE = {429, 500, 502, 503, 504}
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "1024"))
 STATIC_DIR = Path(os.getenv("STATIC_DIR", Path(__file__).parent / "static")).resolve()
@@ -49,17 +58,11 @@ class GenRequest(BaseModel):
 
 
 # ---------------------------------------------------------------- providers
-async def call_gemini(req: GenRequest) -> str:
-    if not GEMINI_API_KEY:
-        raise HTTPException(500, "GEMINI_API_KEY is not set")
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
+async def _gemini_once(client: httpx.AsyncClient, model: str, req: GenRequest) -> str:
     payload = {
         "contents": [{"parts": [{"text": req.prompt}]}],
         "generationConfig": {
-            # 2.5-flash counts thinking tokens against maxOutputTokens; reserve
+            # Flash models count thinking tokens against maxOutputTokens; reserve
             # the thinking budget on top so long JSON replies aren't cut off.
             "maxOutputTokens": req.max_tokens + GEMINI_THINKING_BUDGET,
             "temperature": req.temperature,
@@ -67,19 +70,51 @@ async def call_gemini(req: GenRequest) -> str:
             "thinkingConfig": {"thinkingBudget": GEMINI_THINKING_BUDGET},
         },
     }
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            url, params={"key": GEMINI_API_KEY}, json=payload
-        )
+    r = await client.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={"x-goog-api-key": GEMINI_API_KEY},  # header, so the key never lands in URLs/logs
+        json=payload,
+    )
     if r.status_code != 200:
-        raise HTTPException(502, f"Gemini {r.status_code}: {r.text[:500]}")
+        raise _Upstream(r.status_code, f"Gemini {model} {r.status_code}: {r.text[:300]}")
     data = r.json()
     try:
         parts = data["candidates"][0]["content"]["parts"]
         # skip thought parts if the API ever returns them
         return "".join(p.get("text", "") for p in parts if not p.get("thought"))
     except (KeyError, IndexError, TypeError):
-        raise HTTPException(502, f"Gemini returned no text: {json.dumps(data)[:500]}")
+        raise _Upstream(502, f"Gemini {model} returned no text: {json.dumps(data)[:300]}")
+
+
+class _Upstream(Exception):
+    def __init__(self, status: int, msg: str):
+        super().__init__(msg)
+        self.status = status
+
+
+async def call_gemini(req: GenRequest) -> str:
+    """Try each model in GEMINI_MODELS; fall through on overload, rate limit,
+    server error or timeout. Other errors (bad key, bad request) fail fast."""
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY is not set")
+    errors = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(GEMINI_TIMEOUT, connect=10)) as client:
+        for model in GEMINI_MODELS:
+            try:
+                return await _gemini_once(client, model, req)
+            except httpx.TimeoutException:
+                errors.append(f"Gemini {model} timed out after {GEMINI_TIMEOUT:.0f}s")
+            except httpx.HTTPError as e:
+                errors.append(f"Gemini {model} network error: {type(e).__name__}")
+            except _Upstream as e:
+                errors.append(str(e))
+                if e.status not in RETRYABLE:
+                    raise HTTPException(502, str(e))
+    timed_out = all("timed out" in e for e in errors)
+    raise HTTPException(
+        504 if timed_out else 503,
+        "The AI model is overloaded right now — try again in a minute. " + " | ".join(errors)[:900],
+    )
 
 
 async def call_anthropic(req: GenRequest) -> str:
@@ -183,10 +218,15 @@ async def health():
 @app.post("/api/generate")
 async def generate(req: GenRequest, request: Request):
     check_rate(request)
-    if PROVIDER == "anthropic":
-        text = await call_anthropic(req)
-    else:
-        text = await call_gemini(req)
+    try:
+        if PROVIDER == "anthropic":
+            text = await call_anthropic(req)
+        else:
+            text = await call_gemini(req)
+    except httpx.TimeoutException:
+        raise HTTPException(504, "The AI model took too long to answer — try again.")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Could not reach the AI provider ({type(e).__name__}).")
     parsed = extract_json(text)
     if parsed is None:
         # surface the model's actual reply so the frontend can show a real error
