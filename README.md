@@ -51,10 +51,12 @@ docker run -p 8080:8080 -e GEMINI_API_KEY=your-key asvab-forge
 |---|---|---|
 | `LLM_PROVIDER` | `gemini` | `gemini` or `anthropic` |
 | `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | — | server-side only |
-| `GEMINI_MODEL` | `gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite` | comma list: first is primary, the rest are fallbacks on 429/5xx/timeout |
-| `GEMINI_TIMEOUT` | `45` | seconds per model attempt |
+| `GEMINI_MODEL` | `gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite` | preference order for hedged fallback |
+| `GEMINI_TIMEOUT` | `30` | seconds per model attempt |
+| `GEMINI_HEDGE_AFTER` | `8` | seconds before racing the next model |
+| `GEMINI_THINKING_BUDGET_HIGH` | `1024` | budget for `thinking: "high"` requests (auditor) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | |
-| `GEMINI_THINKING_BUDGET` | `1024` | added on top of `max_tokens` (see below) |
+| `GEMINI_THINKING_BUDGET` | `256` | default budget, added on top of `max_tokens` |
 | `RATE_LIMIT_PER_HOUR` | `60` | per client IP, `/api/generate` only |
 | `STATIC_DIR` | `./static` beside `main.py` | Docker copies the Vite build here |
 
@@ -122,7 +124,9 @@ For Anthropic, create an `anthropic-api-key` secret the same way and deploy with
 - **Offline drills.** With fewer than 5 banked questions and no network, a drill serves whatever is banked instead of erroring. The error appears only when the bank for that subtest is empty.
 - **Plain-text math.** The question, lesson and auditor prompts all require printed-test Unicode (x², √(x+1), π, ×, a/b) and forbid LaTeX. As a safety net, `cleanMath()` in `App.jsx` converts any LaTeX that slips through. It runs on every question, choice, explanation and lesson field, and at load time on the saved bank, redemption queue and lessons. A `$…$` pair counts as math only when it contains LaTeX markers, so prices like `$12` survive. Unit tests: `cd frontend && npm test`.
 - **Audit tolerance.** Questions the auditor skips are kept. Only explicit disagreements are dropped.
-- **Gemini model chain.** `gemini-2.5-flash` (the original spec) is closed to new API users, and the newer Flash models return 503 "high demand" or hang at busy times. The backend tries `gemini-3.8-flash` → `gemini-3.5-flash` → `gemini-3.5-flash-lite`, moving on after 429/5xx or a 45s timeout. Bad-key and bad-request errors fail fast. Upstream timeouts return a 504 with a readable message instead of a bare 500, and the key goes in the `x-goog-api-key` header, never the URL.
+- **Gemini model chain, tuned for speed.** `gemini-2.5-flash` (the original spec) is closed to new API users, and `gemini-3.8-flash` hung for 60s on every call in testing. Measured on 2026-10-30 for a 5-question batch: 3.5-flash took 5.5–7.6s, 3.5-flash-lite 2.4s and 3.1-flash-lite 5s. The backend uses 3.5-flash → 3.5-flash-lite → 3.1-flash-lite with hedging: a 429/5xx hands off to the next model at once, and a model still silent after 8s gets raced by the next. The first answer wins and the rest are cancelled. Bad-key and bad-request errors fail fast, upstream timeouts return a readable 504, and the key goes in the `x-goog-api-key` header, never the URL.
+- **Thinking budgets.** The default is 256 tokens: 1024 cost 1–2s per call without better questions, and 0 is rejected by the lite models. The answer-key auditor asks for `thinking: "high"` (1024) because accuracy matters more than speed there.
+- **Speed on the client.** The timed test generates all four sections in parallel when you press Start, so a whole mini-AFQT took about 14s instead of one wait per section. On app open the offline bank for today's weak-subtest mission fills in the background, so the first drill is usually instant. The spinner shows elapsed seconds. Measured end to end: AR batch with audit 9s (was ~105s), lesson 6s (was ~50s).
 - **Separate secret.** The deploy uses `asvab-forge-gemini-key`, not `gemini-api-key`, because Study Forge already reads `gemini-api-key:latest` in the same project.
 - **Gemini thinking budget.** gemini-2.5-flash counts thinking tokens against `maxOutputTokens`, which silently truncated long JSON such as lessons. The backend sets `thinkingBudget` (default 1024) and adds it on top of the requested `max_tokens`.
 - **`extract_json` picks the bracket that opens first.** A chatty reply wrapping `{"steps":[...]}` then parses as the object, not the inner array.

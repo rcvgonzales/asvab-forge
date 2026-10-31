@@ -378,11 +378,11 @@ const finalize = (st) => {
 }
 
 /* ================================================================== api */
-async function generate(prompt, maxTokens = 4096) {
+async function generate(prompt, maxTokens = 4096, thinking = 'low') {
   const r = await fetch('/api/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, max_tokens: maxTokens }),
+    body: JSON.stringify({ prompt, max_tokens: maxTokens, thinking }),
   })
   const body = await r.json().catch(() => null)
   if (!r.ok || !body || body.error) {
@@ -496,7 +496,7 @@ async function getQuestions(sub, n, level, notes) {
   let qs = sanitize(await generate(questionPrompt(sub, n, level, notes)))
   if ((sub.id === 'AR' || sub.id === 'MK') && qs.length) {
     try {
-      const audit = await generate(verifyPrompt(qs), 2048)
+      const audit = await generate(verifyPrompt(qs), 2048, 'high')
       const keyOf = new Map((Array.isArray(audit) ? audit : [])
         .filter((x) => x && Number.isInteger(Number(x.i)))
         .map((x) => [Number(x.i), Number(x.answer)]))
@@ -516,10 +516,18 @@ function Bar({ pct, color = C.blaze, h = 6 }) {
   )
 }
 function Spinner({ text }) {
+  const [secs, setSecs] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => setSecs((x) => x + 1), 1000)
+    return () => clearInterval(t)
+  }, [])
   return (
     <div style={{ ...S.card, textAlign: 'center', padding: 32 }}>
-      <div style={{ fontFamily: F.mono, color: C.blaze, fontSize: 13, letterSpacing: '0.1em' }}>GENERATING…</div>
+      <div style={{ fontFamily: F.mono, color: C.blaze, fontSize: 13, letterSpacing: '0.1em' }}>
+        GENERATING… <span style={{ color: C.khaki }}>{secs}s</span>
+      </div>
       <p style={{ color: C.khaki, fontSize: 13, marginBottom: 0 }}>{text}</p>
+      {secs >= 20 && <p style={{ color: C.khaki, fontSize: 11, marginBottom: 0 }}>The AI is busy — switching to a backup model.</p>}
     </div>
   )
 }
@@ -1223,15 +1231,23 @@ function TimedTest({ state, setState, goHome }) {
   const sec = TEST_PLAN[secIdx]
 
   /* fresh questions first; top up (or, offline, fill entirely) from the bank */
+  /* all sections are generated in parallel when the test starts, so later sections
+     are usually ready the moment the previous one ends */
+  const pre = useRef({})
+  const fetchFresh = (idx) => {
+    const s = TEST_PLAN[idx]
+    if (!navigator.onLine) return Promise.resolve({ qs: [] })
+    return getQuestions(s, s.n, 'moderate, exam-realistic', stateRef.current.notes?.[s.id])
+      .then((qs) => ({ qs: qs.slice(0, s.n) }), (err) => ({ qs: [], err }))
+  }
   const startSection = async (idx) => {
     const s = TEST_PLAN[idx]
     setSecIdx(idx); setPhase('loading'); setErr(null)
     try {
-      let clean = []
-      if (navigator.onLine) {
-        try { clean = (await getQuestions(s, s.n, 'moderate, exam-realistic', stateRef.current.notes?.[s.id])).slice(0, s.n) }
-        catch (e) { if (!(stateRef.current.bank[s.id] || []).length) throw e }
-      }
+      const got = await (pre.current[idx] || fetchFresh(idx))
+      delete pre.current[idx]   // a retry after failure must refetch
+      let clean = got.qs
+      if (got.err && !(stateRef.current.bank[s.id] || []).length) throw got.err
       const need = s.n - clean.length
       if (need > 0) {
         const fromBank = (stateRef.current.bank[s.id] || []).slice(0, need)
@@ -1250,7 +1266,11 @@ function TimedTest({ state, setState, goHome }) {
     } catch (e) { setErr(e); setPhase('intro') }
   }
 
-  const begin = () => { setAnswers([]); setFinal(null); startSection(0) }
+  const begin = () => {
+    setAnswers([]); setFinal(null)
+    TEST_PLAN.forEach((_, k) => { pre.current[k] = fetchFresh(k) })
+    startSection(0)
+  }
 
   useEffect(() => {
     if (phase !== 'run') return
@@ -1592,6 +1612,19 @@ export default function App() {
   })
 
   const go = (v, sub = null) => { setDrillSub(sub); setView(v); setNav((n) => n + 1); window.scrollTo(0, 0) }
+
+  // warm the offline bank for today's weak-subtest mission so the first drill is instant
+  useEffect(() => {
+    const s = weakestSub(state)
+    if (!navigator.onLine || (state.bank[s.id] || []).length >= 5) return
+    getQuestions(s, BANK_BATCH, levelFor(state, s.id), state.notes?.[s.id])
+      .then((fresh) => setState((st) => {
+        const next = structuredClone(st)
+        next.bank[s.id] = [...(next.bank[s.id] || []), ...fresh].slice(0, 30)
+        return next
+      }))
+      .catch(() => {})
+  }, []) // eslint-disable-line
 
   // the app may stay open past midnight: roll daily missions over on navigation / focus
   useEffect(() => {

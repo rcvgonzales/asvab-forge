@@ -10,15 +10,20 @@ Env vars:
   LLM_PROVIDER      gemini | anthropic          (default: gemini)
   GEMINI_API_KEY    required if provider=gemini
   ANTHROPIC_API_KEY required if provider=anthropic
-  GEMINI_MODEL      comma list, first = primary, rest = fallbacks on 429/5xx/timeout
-                    default: gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite
-  GEMINI_TIMEOUT    per-model attempt timeout in seconds (default: 45)
+  GEMINI_MODEL      comma list in preference order; on 429/5xx the next model starts at once,
+                    and a model still silent after GEMINI_HEDGE_AFTER gets raced by the next
+                    default: gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite
+  GEMINI_TIMEOUT    per-model attempt timeout in seconds (default: 30)
+  GEMINI_HEDGE_AFTER seconds before racing the next model (default: 8)
   ANTHROPIC_MODEL   default: claude-sonnet-4-6
-  GEMINI_THINKING_BUDGET  default: 1024 (added on top of max_tokens so thinking can't truncate output)
+  GEMINI_THINKING_BUDGET       default: 256  (requests with thinking="low")
+  GEMINI_THINKING_BUDGET_HIGH  default: 1024 (thinking="high", e.g. the answer-key auditor)
+                    budgets are added on top of max_tokens so thinking can't truncate output
   STATIC_DIR        default: ./static next to this file (Docker copies the Vite build here)
   RATE_LIMIT_PER_HOUR default: 60 (per client IP, /api/generate only)
 """
 
+import asyncio
 import json
 import os
 import re
@@ -30,21 +35,27 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # secrets often carry a trailing newline
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-# gemini-2.5-flash is closed to new API users; first model is primary, the rest are fallbacks
+# gemini-2.5-flash is closed to new API users and 3.8-flash hangs under load;
+# measured 2026-10: 3.5-flash ~6s, 3.5-flash-lite ~2.5s, 3.1-flash-lite ~5s for 5 questions
 GEMINI_MODELS = [
     m.strip()
-    for m in os.getenv("GEMINI_MODEL", "gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite").split(",")
+    for m in os.getenv("GEMINI_MODEL", "gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite").split(",")
     if m.strip()
 ]
-GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "45"))
+GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "30"))
+GEMINI_HEDGE_AFTER = float(os.getenv("GEMINI_HEDGE_AFTER", "8"))
 RETRYABLE = {429, 500, 502, 503, 504}
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "1024"))
+# 0 is rejected by some lite models, so the floor is a small budget, not "off"
+GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "256"))
+GEMINI_THINKING_BUDGET_HIGH = int(os.getenv("GEMINI_THINKING_BUDGET_HIGH", "1024"))
 STATIC_DIR = Path(os.getenv("STATIC_DIR", Path(__file__).parent / "static")).resolve()
 
 app = FastAPI(title="asvab-forge")
@@ -55,19 +66,20 @@ class GenRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=12_000)
     max_tokens: int = Field(4096, ge=256, le=8192)
     temperature: float = Field(0.8, ge=0.0, le=1.5)
+    thinking: Literal["low", "high"] = "low"
 
 
 # ---------------------------------------------------------------- providers
-async def _gemini_once(client: httpx.AsyncClient, model: str, req: GenRequest) -> str:
+async def _gemini_once(client: httpx.AsyncClient, model: str, req: GenRequest, budget: int) -> str:
     payload = {
         "contents": [{"parts": [{"text": req.prompt}]}],
         "generationConfig": {
             # Flash models count thinking tokens against maxOutputTokens; reserve
             # the thinking budget on top so long JSON replies aren't cut off.
-            "maxOutputTokens": req.max_tokens + GEMINI_THINKING_BUDGET,
+            "maxOutputTokens": req.max_tokens + budget,
             "temperature": req.temperature,
             "responseMimeType": "application/json",
-            "thinkingConfig": {"thinkingBudget": GEMINI_THINKING_BUDGET},
+            "thinkingConfig": {"thinkingBudget": budget},
         },
     }
     r = await client.post(
@@ -93,24 +105,51 @@ class _Upstream(Exception):
 
 
 async def call_gemini(req: GenRequest) -> str:
-    """Try each model in GEMINI_MODELS; fall through on overload, rate limit,
-    server error or timeout. Other errors (bad key, bad request) fail fast."""
+    """Hedged fallback across GEMINI_MODELS. A model that fails retryably (429/5xx,
+    timeout, network) hands off to the next one immediately; one that is merely slow
+    gets raced by the next after GEMINI_HEDGE_AFTER seconds. First success wins and
+    the stragglers are cancelled. Non-retryable errors (bad key, bad request) fail fast."""
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY is not set")
-    errors = []
+    budget = GEMINI_THINKING_BUDGET_HIGH if req.thinking == "high" else GEMINI_THINKING_BUDGET
+    errors: list[str] = []
+    queue = list(GEMINI_MODELS)
+    pending: dict[asyncio.Task, str] = {}
     async with httpx.AsyncClient(timeout=httpx.Timeout(GEMINI_TIMEOUT, connect=10)) as client:
-        for model in GEMINI_MODELS:
-            try:
-                return await _gemini_once(client, model, req)
-            except httpx.TimeoutException:
-                errors.append(f"Gemini {model} timed out after {GEMINI_TIMEOUT:.0f}s")
-            except httpx.HTTPError as e:
-                errors.append(f"Gemini {model} network error: {type(e).__name__}")
-            except _Upstream as e:
-                errors.append(str(e))
-                if e.status not in RETRYABLE:
-                    raise HTTPException(502, str(e))
-    timed_out = all("timed out" in e for e in errors)
+
+        def launch() -> bool:
+            if not queue:
+                return False
+            model = queue.pop(0)
+            pending[asyncio.create_task(_gemini_once(client, model, req, budget))] = model
+            return True
+
+        launch()
+        try:
+            while pending:
+                done, _ = await asyncio.wait(
+                    pending, timeout=GEMINI_HEDGE_AFTER, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    launch()  # still silent: race the next model alongside
+                    continue
+                for task in done:
+                    model = pending.pop(task)
+                    try:
+                        return task.result()
+                    except httpx.TimeoutException:
+                        errors.append(f"Gemini {model} timed out after {GEMINI_TIMEOUT:.0f}s")
+                    except httpx.HTTPError as e:
+                        errors.append(f"Gemini {model} network error: {type(e).__name__}")
+                    except _Upstream as e:
+                        errors.append(str(e))
+                        if e.status not in RETRYABLE:
+                            raise HTTPException(502, str(e))
+                    launch()  # failed: hand off right away
+        finally:
+            for task in pending:
+                task.cancel()
+    timed_out = bool(errors) and all("timed out" in e for e in errors)
     raise HTTPException(
         504 if timed_out else 503,
         "The AI model is overloaded right now — try again in a minute. " + " | ".join(errors)[:900],

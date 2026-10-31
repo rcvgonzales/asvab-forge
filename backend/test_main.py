@@ -81,7 +81,7 @@ def test_gemini_falls_back_on_overload(mod, monkeypatch):
     monkeypatch.setattr(mod, "GEMINI_MODELS", ["busy", "slow", "good"])
     seen = []
 
-    async def once(client, model, req):
+    async def once(client, model, req, budget):
         seen.append(model)
         if model == "busy":
             raise mod._Upstream(503, "Gemini busy 503: high demand")
@@ -97,7 +97,7 @@ def test_gemini_falls_back_on_overload(mod, monkeypatch):
     assert seen == ["busy", "slow", "good"]
 
     # non-retryable (bad key) fails fast without trying fallbacks
-    async def bad(client, model, req):
+    async def bad(client, model, req, budget):
         seen.append(model)
         raise mod._Upstream(400, "Gemini busy 400: API key not valid")
 
@@ -108,13 +108,57 @@ def test_gemini_falls_back_on_overload(mod, monkeypatch):
     assert e.value.status_code == 502 and seen == ["busy"]
 
     # everything overloaded -> 503 with a human message
-    async def overloaded(client, model, req):
+    async def overloaded(client, model, req, budget):
         raise mod._Upstream(503, f"Gemini {model} 503")
 
     monkeypatch.setattr(mod, "_gemini_once", overloaded)
     with pytest.raises(mod.HTTPException) as e:
         asyncio.run(mod.real_call_gemini(req))
     assert e.value.status_code == 503 and "overloaded" in e.value.detail
+
+
+def test_gemini_hedges_slow_model_and_cancels_it(mod, monkeypatch):
+    import asyncio
+    import time
+
+    monkeypatch.setattr(mod, "GEMINI_API_KEY", "test")
+    monkeypatch.setattr(mod, "GEMINI_MODELS", ["slow", "fast"])
+    monkeypatch.setattr(mod, "GEMINI_HEDGE_AFTER", 0.05)
+    cancelled = []
+
+    async def once(client, model, req, budget):
+        if model == "slow":
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancelled.append(model)
+                raise
+            return '"slow"'
+        return '"fast"'
+
+    monkeypatch.setattr(mod, "_gemini_once", once)
+    t = time.time()
+    assert asyncio.run(mod.real_call_gemini(mod.GenRequest(prompt="x"))) == '"fast"'
+    assert time.time() - t < 1 and cancelled == ["slow"]
+
+
+def test_thinking_levels(mod, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(mod, "GEMINI_API_KEY", "test")
+    monkeypatch.setattr(mod, "GEMINI_MODELS", ["m"])
+    budgets = []
+
+    async def once(client, model, req, budget):
+        budgets.append(budget)
+        return "{}"
+
+    monkeypatch.setattr(mod, "_gemini_once", once)
+    asyncio.run(mod.real_call_gemini(mod.GenRequest(prompt="x")))
+    asyncio.run(mod.real_call_gemini(mod.GenRequest(prompt="x", thinking="high")))
+    assert budgets == [mod.GEMINI_THINKING_BUDGET, mod.GEMINI_THINKING_BUDGET_HIGH]
+    r = TestClient(mod.app).post("/api/generate", json={"prompt": "x", "thinking": "max"})
+    assert r.status_code == 422
 
 
 def test_health_and_spa(mod):
