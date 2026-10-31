@@ -731,7 +731,7 @@ function SettingsCard({ state, setState }) {
   const fileRef = useRef(null)
   const [notesSub, setNotesSub] = useState('AR')
   const [resetOpen, setResetOpen] = useState(false)
-  const [keepContent, setKeepContent] = useState(true)
+  const [keepContent, setKeepContent] = useState(false)
   const doReset = () => {
     // the older v1 save is a load-time fallback; drop it so it can't resurrect old progress
     try { localStorage.removeItem('asvabforge.v1') } catch { /* private mode */ }
@@ -762,7 +762,7 @@ function SettingsCard({ state, setState }) {
     e.target.value = ''
   }
   return (
-    <div style={{ ...S.card, marginBottom: 20 }}>
+    <div id="settings" style={{ ...S.card, marginBottom: 20, scrollMarginTop: 12 }}>
       <div style={S.label}>Settings</div>
       <div style={{ marginTop: 12, fontSize: 13 }}>
         <label style={{ color: C.khaki }}>Test date (drives mission intensity)</label>
@@ -831,22 +831,24 @@ function SettingsCard({ state, setState }) {
       {!resetOpen ? (
         <button style={{ ...S.btnGhost, marginTop: 12, textAlign: 'center', color: C.red, borderColor: C.red }}
           onClick={() => setResetOpen(true)}>
-          Reset progress…
+          Reset all progress…
         </button>
       ) : (
         <div style={{ marginTop: 12, padding: 12, borderRadius: 10, border: `1px solid ${C.red}`, background: 'rgba(196,80,60,0.08)' }}>
-          <div style={{ ...S.label, color: C.red }}>Start over?</div>
+          <div style={{ fontFamily: F.disp, fontWeight: 800, fontSize: 20, color: C.red }}>Are you sure?</div>
           <p style={{ fontSize: 13, lineHeight: 1.5, margin: '6px 0 10px' }}>
-            This erases your XP and rank, accuracy stats, test history, streak, missions, redemption queue, vocab deck, test date and target job, and brings back the day-one diagnostic. It can't be undone — export a backup first if you might want it.
+            This permanently erases <strong>everything</strong>: XP and rank, accuracy stats, test history, streak, missions, redemption queue, vocab deck, test date, target job{keepContent ? '' : ', saved lessons, offline questions and study notes'}. You'll start over at E-1 with the day-one diagnostic. This can't be undone — export a backup first if you might want it.
           </p>
           <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 13, color: C.sand, cursor: 'pointer' }}>
             <input type="checkbox" checked={keepContent} onChange={(e) => setKeepContent(e.target.checked)}
               style={{ marginTop: 2, accentColor: C.blaze }} />
-            <span>Keep my saved lessons, offline question bank and study notes (no new API calls needed for them)</span>
+            <span>Keep my saved lessons, offline questions and study notes (optional — saves regenerating them)</span>
           </label>
           <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
             <button style={{ ...S.btnGhost, textAlign: 'center' }} onClick={() => setResetOpen(false)}>Cancel</button>
-            <button style={{ ...S.btn, background: C.red, color: C.sand }} onClick={doReset}>Yes, reset</button>
+            <button style={{ ...S.btn, background: C.red, color: C.sand }} onClick={doReset}>
+              {keepContent ? 'Yes, reset progress' : 'Yes, erase everything'}
+            </button>
           </div>
         </div>
       )}
@@ -860,7 +862,15 @@ function Home({ state, setState, go }) {
   const banked = Object.values(state.bank).reduce((a, b) => a + (b?.length || 0), 0)
   return (
     <div>
-      <h1 style={S.h1}>ASVAB Forge</h1>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <h1 style={S.h1}>ASVAB Forge</h1>
+        <button
+          onClick={() => document.getElementById('settings')?.scrollIntoView({ behavior: 'smooth' })}
+          style={{ background: 'none', border: `1px solid ${C.line}`, borderRadius: 8, padding: '6px 10px', marginTop: 12,
+            color: C.khaki, fontFamily: F.mono, fontSize: 11, letterSpacing: '0.08em', cursor: 'pointer' }}>
+          ⚙ SETTINGS
+        </button>
+      </div>
       <p style={S.sub}>
         {state.streak.days > 0
           ? <>day <span style={{ fontFamily: F.mono, color: C.blaze }}>{state.streak.days}</span> streak

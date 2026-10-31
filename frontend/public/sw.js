@@ -1,6 +1,6 @@
 // App-shell cache: makes the PWA genuinely work offline.
 // API calls are never cached; drills run offline from the localStorage question bank.
-const CACHE = 'asvab-forge-v3'
+const CACHE = 'asvab-forge-v4'
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png']
 
 self.addEventListener('install', (e) => {
@@ -29,13 +29,15 @@ self.addEventListener('fetch', (e) => {
   // never touch generation calls or anything that isn't a plain GET
   if (e.request.method !== 'GET' || url.pathname.startsWith('/api/')) return
 
-  // navigations: serve the cached shell instantly (cache-first), refresh it in the
-  // background so the next launch picks up a new deploy
+  // navigations: network-first so a new deploy shows up on the very next open;
+  // fall back to the cached shell when offline or the network is slower than 3s
   if (e.request.mode === 'navigate') {
     e.respondWith(
       caches.match('/').then((hit) => {
-        const net = fetch(e.request).then((res) => put('/', res)).catch(() => hit)
-        return hit || net
+        const net = fetch(e.request).then((res) => put('/', res))
+        if (!hit) return net
+        const slow = new Promise((resolve) => setTimeout(() => resolve(hit), 3000))
+        return Promise.race([net.catch(() => hit), slow])
       })
     )
     return
