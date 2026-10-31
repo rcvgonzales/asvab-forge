@@ -93,15 +93,35 @@ async def _gemini_once(client: httpx.AsyncClient, model: str, req: GenRequest, b
     try:
         parts = data["candidates"][0]["content"]["parts"]
         # skip thought parts if the API ever returns them
-        return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     except (KeyError, IndexError, TypeError):
         raise _Upstream(502, f"Gemini {model} returned no text: {json.dumps(data)[:300]}")
+    # even with responseMimeType=json, lite models occasionally emit broken JSON
+    # (a dropped quote, a truncated reply) — treat that as a model failure so the
+    # next model gets a turn instead of the user seeing an error
+    if extract_json(text) is None:
+        raise _NotJSON(model, text)
+    return text
 
 
 class _Upstream(Exception):
     def __init__(self, status: int, msg: str):
         super().__init__(msg)
         self.status = status
+
+
+class _NotJSON(_Upstream):
+    def __init__(self, model: str, raw: str):
+        super().__init__(422, f"Gemini {model} returned output that isn't valid JSON")
+        self.raw = raw
+
+
+class ModelNotJSON(Exception):
+    """Every model replied, but none with parseable JSON."""
+
+    def __init__(self, raw: str):
+        super().__init__("model_output_not_json")
+        self.raw = raw
 
 
 async def call_gemini(req: GenRequest) -> str:
@@ -113,6 +133,7 @@ async def call_gemini(req: GenRequest) -> str:
         raise HTTPException(500, "GEMINI_API_KEY is not set")
     budget = GEMINI_THINKING_BUDGET_HIGH if req.thinking == "high" else GEMINI_THINKING_BUDGET
     errors: list[str] = []
+    bad_raw: str | None = None
     queue = list(GEMINI_MODELS)
     pending: dict[asyncio.Task, str] = {}
     async with httpx.AsyncClient(timeout=httpx.Timeout(GEMINI_TIMEOUT, connect=10)) as client:
@@ -141,6 +162,9 @@ async def call_gemini(req: GenRequest) -> str:
                         errors.append(f"Gemini {model} timed out after {GEMINI_TIMEOUT:.0f}s")
                     except httpx.HTTPError as e:
                         errors.append(f"Gemini {model} network error: {type(e).__name__}")
+                    except _NotJSON as e:
+                        errors.append(str(e))
+                        bad_raw = e.raw
                     except _Upstream as e:
                         errors.append(str(e))
                         if e.status not in RETRYABLE:
@@ -149,6 +173,8 @@ async def call_gemini(req: GenRequest) -> str:
         finally:
             for task in pending:
                 task.cancel()
+    if bad_raw is not None and all("valid JSON" in e for e in errors):
+        raise ModelNotJSON(bad_raw)
     timed_out = bool(errors) and all("timed out" in e for e in errors)
     raise HTTPException(
         504 if timed_out else 503,
@@ -205,11 +231,24 @@ def extract_json(text: str):
         start = cleaned.find(open_ch)
         end = cleaned.rfind(close_ch)
         if start != -1 and end > start:
-            try:
-                return json.loads(cleaned[start : end + 1])
-            except json.JSONDecodeError:
-                continue
+            candidate = cleaned[start : end + 1]
+            for attempt in (candidate, _repair_json(candidate)):
+                try:
+                    return json.loads(attempt)
+                except json.JSONDecodeError:
+                    continue
     return None
+
+
+# common near-misses from small models, applied only after a strict parse fails
+_TRAILING_COMMA = re.compile(r",\s*([\]}])")
+# an array item that lost its opening quote:  ["a", abandon", "c"]  ->  ["a", "abandon", "c"]
+_MISSING_OPEN_QUOTE = re.compile(r'([\[,]\s*)([A-Za-z0-9][^"\[\]{},:\n]*)"(?=\s*[,\]])')
+
+
+def _repair_json(s: str) -> str:
+    s = _TRAILING_COMMA.sub(r"\1", s)
+    return _MISSING_OPEN_QUOTE.sub(r'\1"\2"', s)
 
 
 # ---------------------------------------------------------------- rate limit
@@ -262,6 +301,11 @@ async def generate(req: GenRequest, request: Request):
             text = await call_anthropic(req)
         else:
             text = await call_gemini(req)
+    except ModelNotJSON as e:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "model_output_not_json", "raw": e.raw[:2000]},
+        )
     except httpx.TimeoutException:
         raise HTTPException(504, "The AI model took too long to answer — try again.")
     except httpx.HTTPError as e:

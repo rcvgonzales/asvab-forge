@@ -161,6 +161,51 @@ def test_thinking_levels(mod, monkeypatch):
     assert r.status_code == 422
 
 
+def test_extract_repairs_near_misses(mod):
+    # the exact failure seen in the live WK section: opening quote dropped on "abandon"
+    broken = (
+        '[ { "q": "The commander directed the troops to augment their defensive positions before nightfall.", '
+        '"choices": ["reinforce", abandon", "inspect", "relocate"], "answer": 0, "explanation": "Augment means to add to." } ]'
+    )
+    got = mod.extract_json(broken)
+    assert got[0]["choices"] == ["reinforce", "abandon", "inspect", "relocate"]
+    assert mod.extract_json('{"a": [1, 2,], "b": "x",}') == {"a": [1, 2], "b": "x"}
+    # repair must not invent structure out of garbage
+    assert mod.extract_json('["a", b c d') is None
+
+
+def test_non_json_reply_falls_through_to_next_model(mod, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(mod, "GEMINI_API_KEY", "test")
+    monkeypatch.setattr(mod, "GEMINI_MODELS", ["sloppy", "good"])
+    seen = []
+
+    async def once(client, model, req, budget):
+        seen.append(model)
+        if model == "sloppy":
+            raise mod._NotJSON(model, '[{"q": "x", "choices": ["a", "b')
+        return '[{"q": "ok"}]'
+
+    monkeypatch.setattr(mod, "_gemini_once", once)
+    assert asyncio.run(mod.real_call_gemini(mod.GenRequest(prompt="x"))) == '[{"q": "ok"}]'
+    assert seen == ["sloppy", "good"]
+
+
+def test_all_models_non_json_returns_422_with_raw(mod, monkeypatch):
+    monkeypatch.setattr(mod, "GEMINI_API_KEY", "test")
+    monkeypatch.setattr(mod, "GEMINI_MODELS", ["a", "b"])
+
+    async def once(client, model, req, budget):
+        raise mod._NotJSON(model, f"not json from {model}")
+
+    monkeypatch.setattr(mod, "_gemini_once", once)
+    monkeypatch.setattr(mod, "call_gemini", mod.real_call_gemini)
+    r = TestClient(mod.app).post("/api/generate", json={"prompt": "x"})
+    assert r.status_code == 422
+    assert r.json()["error"] == "model_output_not_json" and r.json()["raw"].startswith("not json from")
+
+
 def test_health_and_spa(mod):
     c = TestClient(mod.app)
     assert c.get("/api/health").json() == {"ok": True, "provider": "gemini"}

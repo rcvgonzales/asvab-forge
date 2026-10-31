@@ -378,16 +378,30 @@ const finalize = (st) => {
 }
 
 /* ================================================================== api */
-async function generate(prompt, maxTokens = 4096, thinking = 'low') {
-  const r = await fetch('/api/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, max_tokens: maxTokens, thinking }),
-  })
-  const body = await r.json().catch(() => null)
+/* garbled model output and overload are usually one-offs: retry once, quietly,
+   before surfacing an error (429 rate limit and 4xx validation are not retried) */
+const RETRY_STATUS = new Set([422, 502, 503, 504])
+async function generate(prompt, maxTokens = 4096, thinking = 'low', attempt = 0) {
+  let r, body
+  try {
+    r = await fetch('/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, max_tokens: maxTokens, thinking }),
+    })
+    body = await r.json().catch(() => null)
+  } catch (e) {
+    if (attempt === 0 && navigator.onLine) return generate(prompt, maxTokens, thinking, 1)
+    throw new Error('Could not reach the server — check your connection and retry.')
+  }
   if (!r.ok || !body || body.error) {
-    const raw = body && body.raw ? ` — model said: ${body.raw.slice(0, 200)}` : ''
-    throw new Error((body && (body.detail || body.error)) ? `${body.detail || body.error}${raw}` : `HTTP ${r.status}`)
+    const notJson = body?.error === 'model_output_not_json'
+    if (attempt === 0 && (notJson || RETRY_STATUS.has(r.status)) && (r.status !== 422 || notJson)) {
+      return generate(prompt, maxTokens, thinking, 1)
+    }
+    if (notJson) throw new Error(`The AI sent back a garbled answer twice. Tap Retry. (It said: ${String(body.raw || '').slice(0, 120)}…)`)
+    const detail = typeof body?.detail === 'string' ? body.detail : body?.error
+    throw new Error(detail || `HTTP ${r.status}`)
   }
   return body.data
 }
