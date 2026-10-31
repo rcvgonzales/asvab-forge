@@ -219,6 +219,17 @@ const hydrate = (raw) => {
   if (!st.daily || st.daily.date !== today()) st.daily = freshDaily()
   return st
 }
+/* wipe progress; optionally keep the expensive-to-regenerate content (lessons,
+   offline bank) and the user's own study notes */
+const resetState = (st, keepContent) => {
+  const fresh = emptyState()
+  if (keepContent) {
+    fresh.lessons = st.lessons || {}
+    fresh.bank = st.bank || {}
+    fresh.notes = st.notes || {}
+  }
+  return fresh
+}
 const looksLikeBackup = (o) =>
   !!o && typeof o === 'object' && !Array.isArray(o) &&
   !!o.stats && typeof o.stats === 'object' &&
@@ -711,6 +722,15 @@ function PaceCard({ state }) {
 function SettingsCard({ state, setState }) {
   const fileRef = useRef(null)
   const [notesSub, setNotesSub] = useState('AR')
+  const [resetOpen, setResetOpen] = useState(false)
+  const [keepContent, setKeepContent] = useState(true)
+  const doReset = () => {
+    // the older v1 save is a load-time fallback; drop it so it can't resurrect old progress
+    try { localStorage.removeItem('asvabforge.v1') } catch { /* private mode */ }
+    setState((st) => resetState(st, keepContent))
+    setResetOpen(false)
+    window.scrollTo(0, 0)
+  }
   const exportData = () => {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' })
     const a = document.createElement('a')
@@ -800,6 +820,28 @@ function SettingsCard({ state, setState }) {
       <p style={{ fontSize: 11, color: C.khaki, marginBottom: 0 }}>
         Progress lives in this browser only — export a backup before clearing data or switching devices.
       </p>
+      {!resetOpen ? (
+        <button style={{ ...S.btnGhost, marginTop: 12, textAlign: 'center', color: C.red, borderColor: C.red }}
+          onClick={() => setResetOpen(true)}>
+          Reset progress…
+        </button>
+      ) : (
+        <div style={{ marginTop: 12, padding: 12, borderRadius: 10, border: `1px solid ${C.red}`, background: 'rgba(196,80,60,0.08)' }}>
+          <div style={{ ...S.label, color: C.red }}>Start over?</div>
+          <p style={{ fontSize: 13, lineHeight: 1.5, margin: '6px 0 10px' }}>
+            This erases your XP and rank, accuracy stats, test history, streak, missions, redemption queue, vocab deck, test date and target job, and brings back the day-one diagnostic. It can't be undone — export a backup first if you might want it.
+          </p>
+          <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 13, color: C.sand, cursor: 'pointer' }}>
+            <input type="checkbox" checked={keepContent} onChange={(e) => setKeepContent(e.target.checked)}
+              style={{ marginTop: 2, accentColor: C.blaze }} />
+            <span>Keep my saved lessons, offline question bank and study notes (no new API calls needed for them)</span>
+          </label>
+          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+            <button style={{ ...S.btnGhost, textAlign: 'center' }} onClick={() => setResetOpen(false)}>Cancel</button>
+            <button style={{ ...S.btn, background: C.red, color: C.sand }} onClick={doReset}>Yes, reset</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

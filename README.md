@@ -131,6 +131,7 @@ For Anthropic, create an `anthropic-api-key` secret the same way and deploy with
 **Persistence**
 - **Old saves.** Saves are hydrated over fresh defaults (per subtest, plus arrays and objects). A pre-diagnostic save that already has a test result is treated as `diagDone`, so the banner doesn't reappear. Saves are also read from `asvabforge.v1` if no v2 key exists.
 - **Import validation.** Import checks the shape (a `stats` object with numeric attempted/correct, array fields, numeric XP) and rejects anything else with a message before touching state.
+- **Reset progress.** Settings → "Reset progress…" opens an inline confirm panel. By default it keeps saved lessons, the offline question bank and study notes, which are expensive to regenerate or are your own writing, and wipes everything else. It also deletes the legacy `asvabforge.v1` save so the load fallback can't resurrect old progress.
 - **Midnight rollover.** Daily missions roll over on navigation and on window focus as well as on load, so an app left open past midnight resets correctly.
 
 **Service worker and backend**
